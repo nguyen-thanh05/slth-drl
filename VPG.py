@@ -67,17 +67,18 @@ class VPG:
         self.steps_per_epoch = config.steps_per_epoch   # length of the trajectory per epoch
         self.sparsity = config.sparsity
         self.gamma = 0.99
+        self.num_trajectories = config.num_trajectories
         self.device = config.device
 
         self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n, sparsity=self.sparsity)
         self.trajectory_buffer = Trajectory_buffer(self.steps_per_epoch)
 
         self.optimizer = torch.optim.Adam(self.actor.parameters())
+
         return
 
     def collect(self):
         state, info = self.env.reset()
-        print("state ", state)
         for i in range(self.steps_per_epoch):
             probs = self.actor(torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0))
             m = Categorical(probs)
@@ -90,7 +91,7 @@ class VPG:
             state = next_state
 
             if done or truncated:
-                state = self.env.reset()
+                state, info = self.env.reset()
         return
 
     def update(self):
@@ -130,9 +131,10 @@ def main():
         env='CartPole-v1',
         batch=8,
         seed=0,
-        num_epochs=1,
+        num_epochs=10,
         sparsity=0.5,
-        steps_per_epoch=5,
+        steps_per_epoch=30,
+        num_trajectories=1,
         device = 'cpu'
     )
     vpg = VPG(config)
