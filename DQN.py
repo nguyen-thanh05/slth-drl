@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import deque
 import random
 import matplotlib.pyplot as plt
+from Layers import SupermaskLinear, SupermaskConv2d
 
 
-class LinearDQN:
+class DQN:
     def __init__(self, config):
         self.gamma = config.gamma if hasattr(config, 'gamma') else 0.95
         self.epsilon = config.epsilon if hasattr(config, 'epsilon') else 1
@@ -26,10 +26,15 @@ class LinearDQN:
         if type_of_nn == 'linear':
             self.policy_net = Linear_Net(self.state_dim, self.action_dim, config.hidden_dim).to(self.device)
             self.target_net = Linear_Net(self.state_dim, self.action_dim, config.hidden_dim).to(self.device)
+            self.mode = 'normal'
         elif type_of_nn == 'conv2d':
             pass
         elif type_of_nn == 'linear_slth':
-            pass
+            self.policy_net = SLTH_Linear_net(self.state_dim, self.action_dim, config.hidden_dim).to(self.device)
+            self.target_net = SLTH_Linear_net(self.state_dim, self.action_dim, config.hidden_dim).to(self.device)
+            scores = self.policy_net.get_scores()
+            self.target_net.set_scores(scores)
+            self.mode = 'slth'
         elif type_of_nn == 'conv2d_slth':
             pass
         
@@ -47,7 +52,7 @@ class LinearDQN:
         self.replay_buffer.append((state, action, reward, next_state, done))
         
     def optimize_on_batch(self):
-        states, actions, rewards, next_states, dones = zip(*self.replay_buffer.sample(128))
+        states, actions, rewards, next_states, dones = zip(*self.replay_buffer.sample(self.batch_size))
         states_batch = torch.stack(states)
         actions = torch.tensor(actions, device=self.device)
         rewards = torch.tensor(rewards, device=self.device)
@@ -78,6 +83,7 @@ class LinearDQN:
             while not done:
                 action = self.select_action(state)
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
+                reward = self.transform_reward(state, reward)
                 cummulative_reward += reward
                 done = terminated or truncated
                 done = int(done)
@@ -90,14 +96,23 @@ class LinearDQN:
                     loss = self.optimize_on_batch()
 
                 # Update target network
-                target_state_dict = self.target_net.state_dict()
-                policy_state_dict = self.policy_net.state_dict()
-                for key in target_state_dict:
-                    target_state_dict[key] = policy_state_dict[key] * 0.001 + target_state_dict[key] * 0.999
-                self.target_net.load_state_dict(target_state_dict)
+                if self.mode == 'normal':
+                    target_state_dict = self.target_net.state_dict()
+                    policy_state_dict = self.policy_net.state_dict()
+                    for key in target_state_dict:
+                        target_state_dict[key] = policy_state_dict[key] * 0.001 + target_state_dict[key] * 0.999
+                    self.target_net.load_state_dict(target_state_dict)
+                elif self.mode == 'slth':
+                    policy_score = self.policy_net.get_scores()
+                    target_score = self.target_net.get_scores()
+                    updated_score = [None] * len(policy_score)
+                    for i in range(len(policy_score)):
+                        updated_score[i] = policy_score[i] * 0.001 + target_score[i] * 0.999
+                    self.target_net.set_scores(updated_score)
+            
             self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_decay_min)
             self.cummulative_reward_plot.append(cummulative_reward)
-            print(f'Episode: {episode}, Loss: {loss}, CummulativeReward: {cummulative_reward}')
+            print(f'Episode: {episode}, Loss: {loss}, CummulativeReward: {cummulative_reward}, Epsilon: {self.epsilon}')
             
         self.plot_cummulative_reward()
                     
@@ -106,7 +121,29 @@ class LinearDQN:
         plt.xlabel('Episodes')
         plt.ylabel('Cummulative Reward')
         plt.show()
-                
+    
+    def transform_reward(self, state, reward):
+        return reward
+
+    def save_model(self, filename):
+        torch.save(self.policy_net.state_dict(), filename)
+    
+    def load_model(self, filename):
+        self.policy_net.load_state_dict(torch.load(filename))
+    
+    def inference(self):
+        state, _ = self.env.reset()
+        state = torch.tensor(state, device=self.device)
+        done = False
+        while not done:
+            self.env.render()
+            action = self.select_action(state)
+            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            state = torch.tensor(next_state, device=self.device)
+            done = terminated or truncated
+            done = int(done)
+        self.env.close()
+        
 
 class Linear_Net(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim):
@@ -120,6 +157,37 @@ class Linear_Net(nn.Module):
         x = x + F.relu(self.fc2(x))
         x = self.out(x)
         return x
+
+
+class SLTH_Linear_net(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim):
+        super(SLTH_Linear_net, self).__init__()
+        self.fc1 = SupermaskLinear(in_features=input_dim, out_features=hidden_dim, bias=False)
+        self.fc2 = SupermaskLinear(in_features=hidden_dim, out_features=hidden_dim, bias=False)
+        self.fc3 = SupermaskLinear(in_features=hidden_dim, out_features=hidden_dim, bias=False)
+        self.out = SupermaskLinear(in_features=hidden_dim, out_features=output_dim, bias=False)
+        
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = x + F.relu(self.fc2(x))
+        x = x + F.relu(self.fc3(x))
+        x = self.out(x)
+        return x
+    
+    def get_scores(self):
+        return (self.fc1.get_scores().clone(), self.fc2.get_scores().clone(), self.out.get_scores().clone())
+    
+    def set_scores(self, scores):
+        self.fc1.scores = nn.Parameter(scores[0])
+        self.fc2.scores = nn.Parameter(scores[1])
+        self.out.scores = nn.Parameter(scores[2])
+    
+    def set_sparsity(self, sparsity):
+        self.fc1.sparsity = sparsity
+        self.fc2.sparsity = sparsity
+        self.fc3.sparsity = sparsity
+        self.out.sparsity = sparsity
+
 
 class ReplayMemory:
     def __init__(self, max_size):
